@@ -1477,6 +1477,7 @@ class Environment:
 
             self.concretized_order = new_concretized_order
             self.specs_by_hash = new_specs_by_hash
+            self.write()
 
     def concretize(
         self, force: Optional[bool] = None, tests: Union[bool, Sequence] = False
