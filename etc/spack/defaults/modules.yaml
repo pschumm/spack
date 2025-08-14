@@ -42,10 +42,17 @@ modules:
      lmod:   $spack/share/spack/lmod
     # What type of modules to use ("tcl" and/or "lmod")
     enable: []
+    arch_folder: false
 
     tcl:
       all:
         autoload: direct
+      hide_implicits: true
+      hash_length: 0
+      # Note: For some reason, I couldn't get this change to work with lmod/lua
+      # module files :(
+      projections:
+        ^python: '{name}/{version}-python{^python.version}'
 
     # Default configurations if lmod is enabled
     lmod:
