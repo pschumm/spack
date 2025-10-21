@@ -11,7 +11,10 @@ import json
 import os
 import re
 import shutil
+import urllib.parse
 from contextlib import closing, contextmanager
+from datetime import datetime
+from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any, Callable, Dict, List, Optional, Tuple, Type
 
@@ -170,7 +173,7 @@ class URLBuildcacheEntry:
     To help with downloading, this class manages two spack.spec.Stage objects
     internally, which must be destroyed when finished.  Specifically, if you
     call either of the following methods on an instance, you must eventually also
-    call destroy():
+    call destroy()::
 
         fetch_metadata()
         fetch_archive()
@@ -245,7 +248,7 @@ class URLBuildcacheEntry:
 
     @classmethod
     def get_base_url(cls, manifest_url: str) -> str:
-        """Given any manifest url (i.e. one containing 'v3/manifests/') return the
+        """Given any manifest url (i.e. one containing ``v3/manifests/``) return the
         base part of the url"""
         rematch = cls.SPEC_URL_REGEX.match(manifest_url)
         if not rematch:
@@ -592,8 +595,8 @@ class URLBuildcacheEntry:
         compression: str = "none",
     ) -> None:
         """Convenience method to push a local file to a mirror as a blob.  Both manifest
-        and blob are pushed as a component of the given component_type.  If compression
-        is 'gzip' the blob will be compressed before pushing, otherwise it will be pushed
+        and blob are pushed as a component of the given component_type.  If ``compression``
+        is ``"gzip"`` the blob will be compressed before pushing, otherwise it will be pushed
         uncompressed."""
         cache_class = get_url_buildcache_class()
         checksum_algo = "sha256"
@@ -1090,7 +1093,7 @@ def _entries_from_cache_aws_cli(
         A tuple where the first item is a list of local file paths pointing
         to the manifests that should be read from the mirror, and the
         second item is a function taking a url or file path and returning
-        a `URLBuildcacheEntry` for that manifest.
+        a :class:`URLBuildcacheEntry` for that manifest.
     """
     read_fn = None
     file_list = None
@@ -1104,7 +1107,7 @@ def _entries_from_cache_aws_cli(
 
     def file_read_method(manifest_path: str) -> URLBuildcacheEntry:
         cache_entry = cache_class(mirror_url=url, allow_unsigned=True)
-        cache_entry.read_manifest(manifest_url=f"file://{manifest_path}")
+        cache_entry.read_manifest(manifest_url=manifest_path)
         return cache_entry
 
     include_pattern = cache_class.get_buildcache_component_include_pattern(component_type)
@@ -1120,16 +1123,41 @@ def _entries_from_cache_aws_cli(
         tmpspecsdir,
     ]
 
+    # Use aws s3 ls to get mtimes of manifests
+    ls_command_args = ["s3", "ls", "--recursive", url]
+    s3_ls_regex = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s+\d+\s+(.+)$")
+
+    filename_to_mtime: Dict[str, float] = {}
+
     tty.debug(f"Using aws s3 sync to download manifests from {url} to {tmpspecsdir}")
 
     try:
         aws(*sync_command_args, output=os.devnull, error=os.devnull)
         file_list = fsys.find(tmpspecsdir, [include_pattern])
         read_fn = file_read_method
-    except Exception:
-        tty.warn("Failed to use aws s3 sync to retrieve specs, falling back to parallel fetch")
 
-    return file_list, read_fn
+        # Use `aws s3 ls` to get mtimes of manifests
+        for line in aws(*ls_command_args, output=str, error=os.devnull).splitlines():
+            match = s3_ls_regex.match(line)
+            if match:
+                # Parse the url and use the S3 path of the file to derive the
+                # local path of the file (i.e. where `aws s3 sync` put it).
+                parsed_url = urllib.parse.urlparse(url)
+                s3_path = parsed_url.path.lstrip("/")
+                filename = match.group(2)
+                if s3_path and filename.startswith(s3_path):
+                    filename = filename[len(s3_path) :].lstrip("/")
+                local_path = url_util.join(tmpspecsdir, filename)
+
+                if Path(local_path).exists():
+                    filename_to_mtime[url_util.path_to_file_url(local_path)] = datetime.strptime(
+                        match.group(1), "%Y-%m-%d %H:%M:%S"
+                    ).timestamp()
+    except Exception as e:
+        tty.warn("Failed to use aws s3 sync to retrieve specs, falling back to parallel fetch")
+        raise e
+
+    return filename_to_mtime, read_fn
 
 
 def _entries_from_cache_fallback(
@@ -1146,10 +1174,10 @@ def _entries_from_cache_fallback(
         A tuple where the first item is a list of absolute file paths or
         urls pointing to the manifests that should be read from the mirror,
         and the second item is a function taking a url or file path of a manifest and
-        returning a `URLBuildcacheEntry` for that manifest.
+        returning a :class:`URLBuildcacheEntry` for that manifest.
     """
     read_fn = None
-    file_list = None
+    filename_to_mtime = None
 
     cache_class = get_url_buildcache_class(layout_version=CURRENT_BUILD_CACHE_LAYOUT_VERSION)
 
@@ -1159,20 +1187,23 @@ def _entries_from_cache_fallback(
         return cache_entry
 
     try:
-        file_list = [
-            url_util.join(url, entry)
-            for entry in web_util.list_url(url, recursive=True)
+        filename_to_mtime = {}
+
+        for entry in web_util.list_url(url, recursive=True):
             if fnmatch.fnmatch(
                 entry, cache_class.get_buildcache_component_include_pattern(component_type)
-            )
-        ]
+            ):
+                entry_url = url_util.join(url, entry)
+                stat_result = web_util.stat_url(entry_url)
+                if stat_result is not None:
+                    filename_to_mtime[entry_url] = stat_result[1]  # mtime is second element
         read_fn = url_read_method
     except Exception as err:
         # If we got some kind of S3 (access denied or other connection error), the first non
         # boto-specific class in the exception is Exception.  Just print a warning and return
         tty.warn(f"Encountered problem listing packages at {url}: {err}")
 
-    return file_list, read_fn
+    return filename_to_mtime, read_fn
 
 
 def get_entries_from_cache(
@@ -1189,7 +1220,7 @@ def get_entries_from_cache(
         A tuple where the first item is a list of absolute file paths or
         urls pointing to the manifests that should be read from the mirror,
         and the second item is a function taking a url or file path and
-        returning a `URLBuildcacheEntry` for that manifest.
+        returning a :class:`URLBuildcacheEntry` for that manifest.
     """
     callbacks: List[Callable] = []
     if url.startswith("s3://"):
@@ -1198,9 +1229,9 @@ def get_entries_from_cache(
     callbacks.append(_entries_from_cache_fallback)
 
     for specs_from_cache_fn in callbacks:
-        file_list, read_fn = specs_from_cache_fn(url, tmpspecsdir, component_type)
-        if file_list:
-            return file_list, read_fn
+        file_to_mtime_mapping, read_fn = specs_from_cache_fn(url, tmpspecsdir, component_type)
+        if file_to_mtime_mapping:
+            return file_to_mtime_mapping, read_fn
 
     raise ListMirrorSpecsError("Failed to get list of entries from {0}".format(url))
 
@@ -1228,12 +1259,15 @@ def _get_compressor(compression: str, writable: io.BufferedIOBase) -> io.Buffere
 @contextmanager
 def compression_writer(output_path: str, compression: str, checksum_algo: str):
     """Create and return a writer capable of writing compressed data. Available
-    options for compression are "gzip" or "none", checksum_algo is used to pick
-    the checksum algorithm used by the ChecksumWriter.
+    options for ``compression`` are ``"gzip"`` or ``"none"``, ``checksum_algo`` is used to pick
+    the checksum algorithm used by the :class:`~spack.util.archive.ChecksumWriter`.
 
-    Yields a tuple containing:
-        io.IOBase: writer that can compress (or not) as it writes
-        ChecksumWriter: provides checksum and length of written data
+    Yields:
+        A tuple containing
+
+        * An :class:`io.BufferedIOBase` writer that can compress (or not) as it writes
+        * A :class:`~spack.util.archive.ChecksumWriter` that provides checksum and length of
+          written data
     """
     with open(output_path, "wb") as writer, ChecksumWriter(
         fileobj=writer, algorithm=hash_fun_for_algo(checksum_algo)

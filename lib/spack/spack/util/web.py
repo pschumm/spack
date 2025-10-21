@@ -307,8 +307,8 @@ def base_curl_fetch_args(url, timeout=0):
     It also uses the following configuration option to set an additional
     argument as needed:
 
-        * config:connect_timeout (int): connection timeout
-        * config:verify_ssl (str): Perform SSL verification
+    * config:connect_timeout (int): connection timeout
+    * config:verify_ssl (str): Perform SSL verification
 
     Arguments:
         url (str): URL whose contents will be fetched
@@ -382,13 +382,13 @@ def fetch_url_text(url, curl: Optional[Executable] = None, dest_dir="."):
     """Retrieves text-only URL content using the configured fetch method.
     It determines the fetch method from:
 
-        * config:url_fetch_method (str): fetch method to use (e.g., 'curl')
+    * config:url_fetch_method (str): fetch method to use (e.g., 'curl')
 
-    If the method is `curl`, it also uses the following configuration
+    If the method is ``curl``, it also uses the following configuration
     options:
 
-        * config:connect_timeout (int): connection time out
-        * config:verify_ssl (str): Perform SSL verification
+    * config:connect_timeout (int): connection time out
+    * config:verify_ssl (str): Perform SSL verification
 
     Arguments:
         url (str): URL whose contents are to be fetched
@@ -444,9 +444,9 @@ def fetch_url_text(url, curl: Optional[Executable] = None, dest_dir="."):
 def url_exists(url, curl=None):
     """Determines whether url exists.
 
-    A scheme-specific process is used for Google Storage (`gs`) and Amazon
-    Simple Storage Service (`s3`) URLs; otherwise, the configured fetch
-    method defined by `config:url_fetch_method` is used.
+    A scheme-specific process is used for Google Storage (``gs``) and Amazon
+    Simple Storage Service (``s3``) URLs; otherwise, the configured fetch
+    method defined by ``config:url_fetch_method`` is used.
 
     Arguments:
         url (str): URL whose existence is being checked
@@ -626,6 +626,46 @@ def list_url(url, recursive=False):
     elif url.scheme == "gs":
         gcs = GCSBucket(url)
         return gcs.get_all_blobs(recursive=recursive)
+
+
+def stat_url(url: str) -> Optional[Tuple[int, float]]:
+    """Get stat result for a URL.
+
+    Args:
+        url: URL to get stat result for
+    Returns:
+        A tuple of (size, mtime) if the URL exists, None otherwise.
+    """
+    parsed_url = urllib.parse.urlparse(url)
+
+    if parsed_url.scheme == "file":
+        local_file_path = url_util.local_file_path(parsed_url)
+        assert isinstance(local_file_path, str)
+        try:
+            url_stat = Path(local_file_path).stat()
+        except FileNotFoundError:
+            return None
+        return url_stat.st_size, url_stat.st_mtime
+
+    elif parsed_url.scheme == "s3":
+        s3_bucket = parsed_url.netloc
+        s3_key = parsed_url.path.lstrip("/")
+
+        s3 = get_s3_session(url, method="fetch")
+
+        try:
+            head_request = s3.head_object(Bucket=s3_bucket, Key=s3_key)
+        except s3.ClientError as e:
+            if e.response["Error"]["Code"] == "404":
+                return None
+            raise e
+
+        mtime = head_request["LastModified"].timestamp()
+        size = head_request["ContentLength"]
+        return size, mtime
+
+    else:
+        raise NotImplementedError(f"Unrecognized URL scheme: {parsed_url.scheme}")
 
 
 def spider(
